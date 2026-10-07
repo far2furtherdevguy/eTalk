@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>eTalk -- Video Call</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0f1220;color:#fff;font-family:system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom)}
+.s{width:100%;max-width:420px;text-align:center}.s[hidden]{display:none}
+h1{font-size:2.2rem;margin:0 0 8px}p{color:#aab}
+input{width:100%;font-size:2rem;letter-spacing:.6em;text-align:center;padding:14px;border-radius:12px;border:2px solid #334;background:#1a1f35;color:#fff;margin:16px 0}
+button{background:#4f7cff;color:#fff;border:0;border-radius:12px;padding:14px 22px;font-size:1rem;margin:6px;cursor:pointer}
+button.g{background:#2a3050}button.r{background:#e5484d}
+video{width:100%;border-radius:14px;background:#000;max-height:60vh}
+#call{max-width:none;position:fixed;inset:0;background:#000}
+#remote{width:100%;height:100%;max-height:none;border-radius:0;object-fit:cover}
+#local{position:absolute;right:12px;top:calc(env(safe-area-inset-top) + 12px);width:28vw;max-width:140px;height:auto;z-index:2;border:2px solid #fff3}
+#bar{position:absolute;bottom:calc(env(safe-area-inset-bottom) + 16px);left:0;right:0;z-index:2}
+#timer{position:absolute;top:calc(env(safe-area-inset-top) + 14px);left:14px;z-index:2;background:#0008;padding:4px 10px;border-radius:8px}
+.pin{font-size:2.4rem;letter-spacing:.4em;color:#7aa2ff}
+</style>
+</head>
+<body>
+<div class="s" id="home">
+  <h1>eTalk</h1><p>Enter a 4-digit PIN to start or join a call</p>
+  <input id="pin" inputmode="numeric" maxlength="4" placeholder="0000" autocomplete="off">
+  <button id="joinBtn">Join Call</button>
+</div>
+
+<div class="s" id="preview" hidden>
+  <h2>Camera Preview</h2><p>Check your camera before joining</p>
+  <video id="pv" autoplay muted playsinline></video>
+  <div><button class="g" id="pCancel">Cancel</button><button id="enter">Enter Room</button></div>
+</div>
+
+<div class="s" id="waiting" hidden>
+  <h2 id="wtitle">Waiting for someone to join...</h2>
+  <div class="pin" id="wpin"></div>
+  <p>Share this PIN with the person you want to call</p>
+  <button class="g" id="wCancel">Cancel</button>
+</div>
+
+<div class="s" id="call" hidden>
+  <div id="timer">00:00</div>
+  <video id="remote" autoplay playsinline></video>
+  <video id="local" autoplay muted playsinline></video>
+  <div id="bar">
+    <button class="g" id="mic">Mute</button>
+    <button class="g" id="cam">Camera</button>
+    <button class="g" id="share">Share</button>
+    <button class="r" id="leave">Leave</button>
+  </div>
+</div>
+
+<div class="s" id="lost" hidden>
+  <h2>Connection lost</h2><p>Your call was interrupted</p>
+  <button id="reconnect">Reconnect</button><button class="g" id="lLeave">Leave</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+// Your Render URL (used inside the APK). On the web it uses the page's own origin.
+const RENDER_URL = 'https://etalkbackup.onrender.com';
+const SERVER = (window.Capacitor && Capacitor.isNativePlatform && Capacitor.isNativePlatform()) ? RENDER_URL : location.origin;
+const FALLBACK_ICE = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun.relay.metered.ca:80' },
+  { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443', 'turn:openrelay.metered.ca:443?transport=tcp', 'turns:openrelay.metered.ca:443?transport=tcp'],
+    username: 'openrelayproject', credential: 'openrelayproject' }
+];
+const CID = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
+
+const $ = (id) => document.getElementById(id);
+const show = (n) => document.querySelectorAll('.s').forEach((e) => (e.hidden = e.id !== n));
+const wait = (t) => { $('wtitle').textContent = t; show('waiting'); };
+let sock, pc, stream, pin, iceServers = FALLBACK_ICE, tInt, connT, t0, inCall = false, sharing = false, camTrack, pendingC = [], entering = false;
+
+$('pin').oninput = (e) => (e.target.value = e.target.value.replace(/\D/g, ''));
+if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) $('share').style.display = 'none';
+
+async function getMedia() {
+  if (stream) return stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: true }); }
+  catch (e) { alert('Camera/microphone access is required: ' + e.message); throw e; }
+  return stream;
+}
+function stopMedia() { if (stream) stream.getTracks().forEach((t) => t.stop()); stream = null; }
+
+async function loadIce() {
+  try {
+    const c = new AbortController(); setTimeout(() => c.abort(), 8000);
+    const r = await fetch(SERVER + '/ice', { signal: c.signal });
+    const j = await r.json();
+    if (Array.isArray(j) && j.length) iceServers = j;
+  } catch (_) { iceServers = FALLBACK_ICE; }
+}
+
+$('joinBtn').onclick = async () => {
+  pin = $('pin').value;
+  if (pin.length !== 4) return alert('Enter a 4-digit PIN');
+  try { $('pv').srcObject = await getMedia(); show('preview'); } catch (_) {}
+};
+$('pCancel').onclick = () => { stopMedia(); show('home'); };
+$('enter').onclick = async () => {
+  if (entering) return; entering = true;
+  $('wpin').textContent = pin;
+  wait('Connecting to server... (can take up to a minute if it was asleep)');
+  await loadIce();
+  entering = false;
+  connect();
+};
+$('wCancel').onclick = $('leave').onclick = $('lLeave').onclick = hangup;
+$('reconnect').onclick = () => {
+  cleanupPeer(); wait('Reconnecting...');
+  if (sock) { sock.disconnect(); sock.connect(); } else connect();
+};
+
+function connect() {
+  if (sock) { sock.removeAllListeners(); sock.disconnect(); }
+  const s = (sock = io(SERVER, { transports: ['websocket', 'polling'], reconnection: true, reconnectionDelay: 500, reconnectionDelayMax: 4000 }));
+  s.on('connect', () => s.emit('join', pin, CID)); // also re-joins automatically after network drops
+  s.on('waiting', () => wait('Waiting for someone to join...'));
+  s.on('matched', ({ initiator }) => startPeer(initiator));
+  s.on('signal', onSignal);
+  s.on('peer-left', () => { cleanupPeer(); inCall = false; wait('The other person left. Waiting for them to rejoin...'); });
+  s.on('err', (m) => { alert(m); hangup(); });
+  s.on('disconnect', (reason) => { if (sock === s && reason !== 'io client disconnect') { cleanupPeer(); lost(); } });
+  s.on('connect_error', () => { if (inCall) lost(); });
+}
+
+function startPeer(initiator) {
+  cleanupPeer();
+  if (!stream) return hangup();
+  $('local').srcObject = stream;
+  const p = (pc = new RTCPeerConnection({ iceServers }));
+  stream.getTracks().forEach((t) => p.addTrack(t, stream));
+  p.ontrack = (e) => { $('remote').srcObject = e.streams[0]; $('remote').play().catch(() => {}); };
+  p.onicecandidate = (e) => e.candidate && sock && sock.emit('signal', { c: e.candidate });
+  p.onconnectionstatechange = () => {
+    if (p !== pc) return;
+    const s = p.connectionState;
+    if (s === 'connected') { clearTimeout(connT); inCall = true; show('call'); startTimer(); }
+    else if (s === 'failed') lost();
+    else if (s === 'disconnected') setTimeout(() => p === pc && p.connectionState === 'disconnected' && lost(), 5000);
+  };
+  clearTimeout(connT);
+  connT = setTimeout(() => p === pc && p.connectionState !== 'connected' && lost(), 25000);
+  if (initiator) {
+    p.createOffer().then((o) => p.setLocalDescription(o)).then(() => sock.emit('signal', { d: p.localDescription })).catch(console.error);
+  }
+}
+
+async function onSignal({ d, c }) {
+  const p = pc; if (!p) return;
+  try {
+    if (d) {
+      await p.setRemoteDescription(d);
+      for (const x of pendingC.splice(0)) await p.addIceCandidate(x).catch(() => {});
+      if (d.type === 'offer') { await p.setLocalDescription(await p.createAnswer()); sock.emit('signal', { d: p.localDescription }); }
+    } else if (c) {
+      if (p.remoteDescription) await p.addIceCandidate(c); else pendingC.push(c);
+    }
+  } catch (e) { console.error(e); }
+}
+
+function startTimer() {
+  if (tInt) return; t0 = Date.now();
+  tInt = setInterval(() => {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    $('timer').textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }, 1000);
+}
+function cleanupPeer() {
+  clearInterval(tInt); tInt = null; clearTimeout(connT); pendingC = []; $('timer').textContent = '00:00';
+  if (pc) { const p = pc; pc = null; p.close(); }
+  $('remote').srcObject = null;
+}
+function lost() { inCall = false; cleanupPeer(); show('lost'); }
+function hangup() {
+  inCall = false; cleanupPeer();
+  if (sock) { const s = sock; sock = null; s.emit('leave'); s.removeAllListeners(); s.disconnect(); }
+  stopMedia(); sharing = false; entering = false; show('home');
+}
+
+$('mic').onclick = () => { const t = stream.getAudioTracks()[0]; t.enabled = !t.enabled; $('mic').textContent = t.enabled ? 'Mute' : 'Unmute'; };
+$('cam').onclick = () => { const t = stream.getVideoTracks()[0]; t.enabled = !t.enabled; $('cam').textContent = t.enabled ? 'Camera' : 'Cam off'; };
+$('share').onclick = async () => {
+  const sender = pc && pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+  if (!sender) return;
+  if (!sharing) {
+    try {
+      const d = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      camTrack = sender.track; const st = d.getVideoTracks()[0];
+      await sender.replaceTrack(st); st.onended = () => sharing && $('share').click();
+      sharing = true; $('share').textContent = 'Stop share';
+    } catch (_) {}
+  } else {
+    sender.track.stop(); await sender.replaceTrack(camTrack);
+    sharing = false; $('share').textContent = 'Share';
+  }
+};
+</script>
+</body>
+</html>
